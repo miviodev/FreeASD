@@ -20,14 +20,31 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            clang lld mtools python3 \
+            clang lld dosfstools mtools python3 \
             qemu-system-x86 ovmf
 
       - name: Verify toolchain
         run: |
           clang --version
-          ld64.lld --version 2>/dev/null || ld.lld --version
-          mtools --version
+          # ld64.lld may have a version suffix on some Ubuntu releases
+          if command -v ld64.lld &>/dev/null; then
+            ld64.lld --version
+          else
+            # Try versioned name and create symlink
+            LLD_VER=$(ls /usr/bin/ld64.lld-* 2>/dev/null | head -1)
+            if [ -n "$LLD_VER" ]; then
+              sudo ln -sf "$LLD_VER" /usr/bin/ld64.lld
+              echo "Linked $LLD_VER → /usr/bin/ld64.lld"
+              ld64.lld --version
+            else
+              echo "ld64.lld not found, checking lld package contents:"
+              dpkg -L lld | grep ld64 || true
+              ls /usr/bin/lld* /usr/bin/ld* 2>/dev/null || true
+              exit 1
+            fi
+          fi
+          mformat --version
+          mkfs.vfat --version || true   # dosfstools
           python3 --version
 
       - name: Install Rust + apple-darwin target
@@ -37,67 +54,93 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Add x86_64-apple-darwin target
-        run: rustup target add x86_64-apple-darwin
+        run: |
+          source "$HOME/.cargo/env"
+          rustup target add x86_64-apple-darwin
 
       # ── Build ────────────────────────────────────────────────────────────
+      - name: Build bootloader
+        run: make boot
+
       - name: Build kernel
         run: make kernel
 
       - name: Build userland (C utilities)
         run: make -C userland/bin
 
-      - name: Build asdsh
+      - name: Build asdsh shell
         run: make -C userland/sh
 
       - name: Build mifetch
         run: make -C userland/mifetch || true
 
-      - name: Build hx editor (Rust)
-        run: make -C userland/hx || true
-
-      # ── Image ────────────────────────────────────────────────────────────
-      - name: Build prepare-run (live image)
-        run: make prepare-run
-
-      - name: Build USB image (GPT + ESP)
-        run: make usb-image
-
-      # ── Test ─────────────────────────────────────────────────────────────
-      - name: Run hxtest (headless QEMU, ~30s)
+      - name: Build hx editor (Rust, no_std)
         run: |
-          # Patch asdboot.conf in the live image to run the autotest
-          python3 -c "
-          import subprocess, os
-          conf = '''timeout = 0
-          menu
-            title = \"ASD Boot\"
-            default = \"default\"
-          end
-          entry
-            id = \"default\"
-            label = \"ASD Kernel\"
-            kernel = \"/boot/asdkernel.bin\"
-            cmdline = \"autotest_hxtest\"
-          end
-          '''
-          with open('/tmp/boot-ci.conf', 'w') as f:
-              f.write(conf.replace('          ', ''))
-          "
-          mcopy -o -i build/run/live.img /tmp/boot-ci.conf ::/EFI/BOOT/asdboot.conf
-          mcopy -o -i build/run/live.img /tmp/boot-ci.conf ::/boot/asdboot.conf
+          source "$HOME/.cargo/env"
+          make -C userland/hx || true
 
-          OVMF_CODE=$(for f in \
+      # ── Images ───────────────────────────────────────────────────────────
+      - name: Find OVMF firmware
+        id: ovmf
+        run: |
+          for code in \
             /usr/share/OVMF/OVMF_CODE.fd \
             /usr/share/OVMF/OVMF_CODE_4M.fd \
-            /usr/share/edk2/x64/OVMF_CODE.4m.fd; \
-            do [ -f "$f" ] && echo "$f" && break; done)
-
-          OVMF_VARS=$(for f in \
+            /usr/share/edk2/x64/OVMF_CODE.4m.fd \
+            /usr/share/qemu/OVMF.fd; do
+            if [ -f "$code" ]; then
+              echo "code=$code" >> "$GITHUB_OUTPUT"
+              break
+            fi
+          done
+          for vars in \
             /usr/share/OVMF/OVMF_VARS.fd \
             /usr/share/OVMF/OVMF_VARS_4M.fd \
-            /usr/share/edk2/x64/OVMF_VARS.4m.fd; \
-            do [ -f "$f" ] && echo "$f" && break; done)
+            /usr/share/edk2/x64/OVMF_VARS.4m.fd; do
+            if [ -f "$vars" ]; then
+              echo "vars=$vars" >> "$GITHUB_OUTPUT"
+              break
+            fi
+          done
+          echo "OVMF_CODE=${{ steps.ovmf.outputs.code }}"
+          echo "OVMF_VARS=${{ steps.ovmf.outputs.vars }}"
 
+      - name: Build live image (prepare-run)
+        run: |
+          make prepare-run \
+            OVMF_CODE="${{ steps.ovmf.outputs.code }}" \
+            OVMF_VARS="${{ steps.ovmf.outputs.vars }}"
+
+      - name: Build USB image (GPT + ESP, for real hardware)
+        run: make usb-image
+
+      # ── Autotest ─────────────────────────────────────────────────────────
+      - name: Patch live image for autotest
+        run: |
+          cat > /tmp/boot-ci.conf << 'CONF'
+          timeout = 0
+
+          menu
+            title = "ASD Boot"
+            default = "default"
+          end
+
+          entry
+            id = "default"
+            label = "ASD Kernel"
+            kernel = "/boot/asdkernel.bin"
+            cmdline = "autotest_hxtest"
+          end
+          CONF
+          # Remove leading spaces from heredoc
+          sed 's/^          //' /tmp/boot-ci.conf > /tmp/boot-ci-clean.conf
+          mcopy -o -i build/run/live.img /tmp/boot-ci-clean.conf ::/EFI/BOOT/asdboot.conf
+          mcopy -o -i build/run/live.img /tmp/boot-ci-clean.conf ::/boot/asdboot.conf
+
+      - name: Run hxtest in headless QEMU (~45s)
+        run: |
+          OVMF_CODE="${{ steps.ovmf.outputs.code }}"
+          OVMF_VARS="${{ steps.ovmf.outputs.vars }}"
           cp "$OVMF_VARS" /tmp/ovmf_vars_ci.fd
 
           timeout 60 qemu-system-x86_64 \
@@ -105,9 +148,9 @@ jobs:
             -cpu qemu64 -m 512 \
             -display none -no-reboot \
             -serial file:/tmp/serial_ci.log \
-            -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
-            -drive if=pflash,format=raw,file=/tmp/ovmf_vars_ci.fd \
-            -drive file=build/run/live.img,if=none,id=live0,format=raw \
+            -drive "if=pflash,format=raw,readonly=on,file=${OVMF_CODE}" \
+            -drive "if=pflash,format=raw,file=/tmp/ovmf_vars_ci.fd" \
+            -drive "file=build/run/live.img,if=none,id=live0,format=raw" \
             -device virtio-blk-pci,drive=live0,bootindex=1 \
             2>/dev/null || true
 
@@ -117,10 +160,16 @@ jobs:
           if grep -q 'HXTEST OK' /tmp/serial_ci.log; then
             echo "✓ HXTEST PASSED"
           elif grep -q 'HXTEST FAIL' /tmp/serial_ci.log; then
+            grep 'HXTEST FAIL' /tmp/serial_ci.log
             echo "✗ HXTEST FAILED"
             exit 1
+          elif grep -q '\*\*\* EXCEPTION' /tmp/serial_ci.log; then
+            grep 'EXCEPTION' /tmp/serial_ci.log
+            echo "✗ KERNEL EXCEPTION"
+            exit 1
           else
-            echo "✗ HXTEST did not complete (kernel may not have booted)"
+            echo "✗ Test did not complete (kernel may not have booted)"
+            grep -E 'ASD|boot|error' /tmp/serial_ci.log | head -20 || true
             exit 1
           fi
 
@@ -128,6 +177,7 @@ jobs:
       - name: Upload USB image
         uses: actions/upload-artifact@v4
         with:
-          name: openasd-1.0-usb-image
+          name: openasd-1.0-usb
           path: build/usb/openasd-1.0.img
           retention-days: 7
+          if-no-files-found: warn
