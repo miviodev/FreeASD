@@ -1,0 +1,13 @@
+[package]
+name = "hx"
+version = "1.0.0"
+edition = "2021"
+
+[lib]
+name = "hx"
+crate-type = ["staticlib"]
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
