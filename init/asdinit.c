@@ -195,6 +195,14 @@ void asdinit_main(void) {
         serial_puts("[autotest] OK — halting (see serial.log; no EXCEPTION lines expected)\n");
         for (;;) __asm__ volatile("cli; hlt");
     }
+    if (kernel_cmdline_has("autotest_nettest")) {
+        g_shell_uid = UID_ROOT;
+        g_shell_gid = GID_ROOT;
+        serial_puts("\n[autotest] nettest — testing ping, DNS, TCP\n");
+        shell_autotest_exec("nettest");
+        serial_puts("[autotest] nettest done — halting\n");
+        for (;;) __asm__ volatile("cli; hlt");
+    }
     if (kernel_cmdline_has("autotest_hxtest")) {
         g_shell_uid = UID_ROOT;
         g_shell_gid = GID_ROOT;
@@ -271,8 +279,7 @@ void asdinit_main(void) {
             static const char *conf =
                 "# apm.conf - ASD Package Manager configuration\n"
                 "#\n"
-                "# Uncomment to enable the official repository:\n"
-                "# repo official https://github.com/komarufan/OpenASD-packages/releases/latest/download\n"
+                "repo official https://github.com/komarufan/OpenASD-packages/releases/latest/download\n"
                 "#\n"
                 "arch=x86_64\n";
             vfs_write(fd, conf, 0);  /* strlen not available here — use vfs_write trick */

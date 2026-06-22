@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: BSD-2-Clause
 # Copyright (c) 2026, ASD Project Contributors
 
-.PHONY: all boot kernel userland uki live-image prepare-run run run-debug run-headless-debug run-gui-debug bfd bfd-debug bfd-autotest bfd-hxtest iso usb-image clean install install-fresh
+.PHONY: all boot kernel userland uki live-image prepare-run run run-debug run-headless-debug run-gui-debug bfd bfd-debug bfd-autotest bfd-hxtest bfd-nettest iso usb-image clean install install-fresh
 
 QEMU ?= qemu-system-x86_64
 QEMU_DISPLAY ?= gtk
@@ -126,7 +126,6 @@ live-image: all
 	@for b in $(LIVE_BINS); do \
 		mcopy -i "$(LIVE_IMG)" userland/bin/build/$$b ::/bin/$$b; \
 	done
-	@mcopy -i "$(LIVE_IMG)" userland/mifetch/build/mifetch ::/bin/mifetch
 	@[ -f userland/hx/build/hx ] && mcopy -i "$(LIVE_IMG)" userland/hx/build/hx ::/bin/hx || true
 	@mcopy -i "$(LIVE_IMG)" userland/sbin/build/asdlog          ::/sbin/asdlog
 	@mcopy -i "$(LIVE_IMG)" userland/sbin/build/netd            ::/sbin/netd
@@ -153,7 +152,6 @@ prepare-run: all
 	@for b in $(LIVE_BINS); do \
 		mcopy -i "$(LIVE_IMG)" userland/bin/build/$$b ::/bin/$$b; \
 	done
-	@mcopy -i "$(LIVE_IMG)" userland/mifetch/build/mifetch ::/bin/mifetch
 	@[ -f userland/hx/build/hx ] && mcopy -i "$(LIVE_IMG)" userland/hx/build/hx ::/bin/hx || true
 	@mcopy -i "$(LIVE_IMG)" userland/sbin/build/asdlog          ::/sbin/asdlog
 	@mcopy -i "$(LIVE_IMG)" userland/sbin/build/netd            ::/sbin/netd
@@ -268,7 +266,6 @@ install: all
 	@for b in $(LIVE_BINS); do \
 		mcopy -o -i "$(DISK_IMG)" userland/bin/build/$$b ::/bin/$$b; \
 	done
-	@mcopy -o -i "$(DISK_IMG)" userland/mifetch/build/mifetch ::/bin/mifetch
 	@[ -f userland/hx/build/hx ] && mcopy -o -i "$(DISK_IMG)" userland/hx/build/hx ::/bin/hx || true
 	@mcopy -o -i "$(DISK_IMG)" userland/sbin/build/asdlog ::/sbin/asdlog
 	@mcopy -o -i "$(DISK_IMG)" userland/sbin/build/netd   ::/sbin/netd
@@ -353,6 +350,23 @@ define write-asdboot-conf-autotest
 		'  label = "ASD Kernel"' \
 		'  kernel = "/boot/asdkernel.bin"' \
 		'  cmdline = "autotest_fastfetch"' \
+		'end' > $(1)
+endef
+
+define write-asdboot-conf-nettest
+	@printf '%s\n' \
+		'timeout = 0' \
+		'' \
+		'menu' \
+		'  title = "ASD Boot"' \
+		'  default = "default"' \
+		'end' \
+		'' \
+		'entry' \
+		'  id = "default"' \
+		'  label = "ASD Kernel"' \
+		'  kernel = "/boot/asdkernel.bin"' \
+		'  cmdline = "autotest_nettest"' \
 		'end' > $(1)
 endef
 
@@ -474,6 +488,50 @@ bfd-hxtest: all
 	@mcopy -i "$(DISK_IMG)" "$(RUN_DIR)/asdboot.conf" ::/EFI/BOOT/asdboot.conf
 	@mcopy -i "$(DISK_IMG)" "$(RUN_DIR)/asdboot.conf" ::/boot/asdboot.conf
 
+# Network autotest — tests ping, DNS, TCP via nettest binary.
+bfd-nettest: all
+	$(call check-mtools)
+	@mkdir -p "$(DEBUG_DIR)"
+	@if [ ! -f "$(DISK_IMG)" ]; then $(MAKE) install; fi
+	@if dd if="$(DISK_IMG)" bs=1 skip=512 count=8 2>/dev/null | grep -aq 'EFI PART'; then \
+		echo "bfd-nettest: $(DISK_IMG) is GPT layout; run: make install-fresh first."; \
+		exit 1; \
+	fi
+	$(call write-asdboot-conf-nettest,"$(RUN_DIR)/asdboot-nettest.conf")
+	@mcopy -i "$(DISK_IMG)" "$(RUN_DIR)/asdboot-nettest.conf" ::/EFI/BOOT/asdboot.conf
+	@mcopy -i "$(DISK_IMG)" "$(RUN_DIR)/asdboot-nettest.conf" ::/boot/asdboot.conf
+	@if [ ! -f "$(OVMF_CODE)" ] || [ ! -f "$(OVMF_VARS)" ]; then \
+		echo "OVMF firmware not found."; exit 1; fi
+	@if [ ! -f "$(OVMF_VARS_BFD)" ]; then cp "$(OVMF_VARS)" "$(OVMF_VARS_BFD)"; fi
+	@rm -f "$(SERIAL_LOG)" "$(QEMU_DEBUG_LOG)"
+	@echo "Running QEMU nettest (timeout 45s)..."
+	@( command -v timeout >/dev/null && timeout 45 $(QEMU) \
+		-machine q35,accel=kvm:tcg -cpu qemu64 -m 1024 -display none -no-reboot \
+		-serial file:$(SERIAL_LOG) \
+		-d guest_errors -D $(QEMU_DEBUG_LOG) \
+		-drive if=pflash,format=raw,readonly=on,file="$(OVMF_CODE)" \
+		-drive if=pflash,format=raw,file="$(OVMF_VARS_BFD)" \
+		-drive file="$(DISK_IMG)",if=none,id=inst0,format=raw \
+		-device virtio-blk-pci,drive=inst0,bootindex=1 \
+		-netdev user,id=net0,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3 \
+		-device virtio-net-pci,netdev=net0 \
+	) || true
+	@echo "--- serial.log ---"
+	@cat "$(SERIAL_LOG)" 2>/dev/null || echo "(no serial log)"
+	@echo "--- end ---"
+	@if grep -q 'NETTEST ALL OK' "$(SERIAL_LOG)" 2>/dev/null; then \
+		echo "PASS: all network tests passed"; \
+	elif grep -q 'NETTEST SOME FAILED' "$(SERIAL_LOG)" 2>/dev/null; then \
+		echo "FAIL: some network tests failed (see log above)"; \
+		exit 1; \
+	else \
+		echo "WARN: no NETTEST result (timeout or boot failure)"; \
+		exit 1; \
+	fi
+	$(call write-asdboot-conf,"$(RUN_DIR)/asdboot.conf")
+	@mcopy -i "$(DISK_IMG)" "$(RUN_DIR)/asdboot.conf" ::/EFI/BOOT/asdboot.conf
+	@mcopy -i "$(DISK_IMG)" "$(RUN_DIR)/asdboot.conf" ::/boot/asdboot.conf
+
 # -----------------------------------------------------------------------
 # usb-image — bootable GPT disk image for writing to USB drives.
 #
@@ -503,7 +561,6 @@ usb-image: all
 	@for b in $(LIVE_BINS); do \
 		mcopy -o -i "$(USB_IMG)@@1M" userland/bin/build/$$b ::/bin/$$b 2>/dev/null || true; \
 	done
-	@mcopy  -o -i "$(USB_IMG)@@1M" userland/mifetch/build/mifetch ::/bin/mifetch 2>/dev/null || true
 	@[ -f userland/hx/build/hx ] && mcopy -o -i "$(USB_IMG)@@1M" userland/hx/build/hx ::/bin/hx || true
 	@mcopy  -o -i "$(USB_IMG)@@1M" userland/sbin/build/asdlog ::/sbin/asdlog 2>/dev/null || true
 	@mcopy  -o -i "$(USB_IMG)@@1M" userland/sbin/build/netd   ::/sbin/netd   2>/dev/null || true

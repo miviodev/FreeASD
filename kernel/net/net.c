@@ -474,13 +474,19 @@ int net_udp_send(uint32_t dst_ip, uint16_t src_port, uint16_t dst_port,
         nexthop = NET_GW_ADDR;
 
     if (arp_lookup(nexthop, dst_mac) != 0) {
-        /* Send ARP request and hope the reply arrives before next poll */
-        arp_send_request(nexthop);
-        /* Poll RX to pick up the ARP reply */
-        virtio_net_rx_poll();
-        if (arp_lookup(nexthop, dst_mac) != 0)
-            return -1;  /* no reply yet */
+        net_dbg("[UDP] ARP miss, resolving gateway...\n");
+        for (int a = 0; a < 30; a++) {
+            arp_send_request(nexthop);
+            for (int p = 0; p < 10; p++) {
+                __asm__ volatile("sti; hlt; cli" ::: "memory");
+                virtio_net_rx_poll();
+                if (arp_lookup(nexthop, dst_mac) == 0) goto udp_arp_ok;
+            }
+        }
+        net_dbg("[UDP] ARP FAIL: no reply from gateway\n");
+        return -1;
     }
+udp_arp_ok:;
 
     /* Build frame */
     uint8_t *p = g_frame_buf;
@@ -540,7 +546,8 @@ void net_init(void) {
     g_udp_tail = 0;
     g_ip_id    = 1;
 
-    /* Probe ARP for gateway so it's in cache immediately */
+    /* Kick off ARP for gateway — reply arrives asynchronously.
+     * Do NOT hlt here: IRQ0 (PIT) is still masked at this point in boot. */
     if (virtio_net_ready())
         arp_send_request(NET_GW_ADDR);
 }
@@ -904,7 +911,11 @@ static int dns_build_query(const char *host, uint8_t *buf, int cap) {
 }
 
 int net_dns_resolve(const char *hostname, uint32_t *ip_out) {
-    if (!virtio_net_ready()) return -1;
+    net_dbg("[DNS] resolve: "); net_dbg(hostname); net_dbg("\n");
+    if (!virtio_net_ready()) {
+        net_dbg("[DNS] FAIL: virtio_net not ready\n");
+        return -1;
+    }
 
     /* Check if it's already a dotted-decimal IP */
     uint32_t ip = 0; int dots = 0; const char *s = hostname;
@@ -921,8 +932,13 @@ int net_dns_resolve(const char *hostname, uint32_t *ip_out) {
     if (qlen < 0) return -1;
 
     /* Send DNS query (UDP) */
+    net_dbg("[DNS] sending UDP to 8.8.8.8:53...\n");
     if (net_udp_send(DNS_SERVER_IP, DNS_SRC_PORT, DNS_PORT,
-                     qbuf, (uint16_t)qlen) != 0) return -1;
+                     qbuf, (uint16_t)qlen) != 0) {
+        net_dbg("[DNS] FAIL: UDP send failed\n");
+        return -1;
+    }
+    net_dbg("[DNS] UDP sent, waiting for reply...\n");
 
     /* Wait for response (up to ~3s, checking UDP ring) */
     static uint8_t rbuf[512];
@@ -971,7 +987,9 @@ int net_dns_resolve(const char *hostname, uint32_t *ip_out) {
             }
             pos += rdlen;
         }
-        return -1; /* no A record found */
+        net_dbg("[DNS] FAIL: no A record in response\n");
+        return -1;
     }
-    return -1; /* timeout */
+    net_dbg("[DNS] FAIL: timeout waiting for UDP reply\n");
+    return -1;
 }
